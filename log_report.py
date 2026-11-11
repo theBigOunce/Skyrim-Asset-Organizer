@@ -15,6 +15,11 @@ def report(path,mod='',contains='',limit=100):
     cache=pathlib.Path(__file__).resolve().parent/'.sao-cache'; cache.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=cache) as temporary:
         with closing(sqlite3.connect(str(pathlib.Path(temporary)/'log.sqlite'))) as db, open(path,encoding='utf-8') as logfile:
+            # Disposable search index; durable recovery data stays in JSONL.
+            db.execute('pragma journal_mode=OFF')
+            db.execute('pragma synchronous=OFF')
+            db.execute('pragma cache_size=-4096')
+            db.execute('pragma temp_store=FILE')
             db.execute('create table mods(name text primary key,data text)')
             db.execute('create table assets(id integer primary key,mod text,path text,data text)')
             db.execute('create table actions(id integer primary key,source int,winner int,kind text,destination text,status text)')
