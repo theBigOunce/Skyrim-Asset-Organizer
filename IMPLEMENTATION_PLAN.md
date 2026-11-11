@@ -4,6 +4,8 @@ Status: implementation started on 2026-11-11 at the user's request. Confirmed: l
 
 ## Recommendation
 
+Implementation update (0.2): preview indexes paths/metadata into disposable SQLite storage, runs off the GUI thread, supports cancellation, and renders action rows lazily. Content hashing is deferred to verified execution. Recovery logs use normalized schema-2 streaming records and batched durable intents; `log_report.py` produces filtered readable exports. Fixture profile changes invalidate plans, and verified output activation is atomically published before source removal. Live mutation remains disabled; apply/export are still synchronous. PERFORMANCE.md records synthetic scale results and their limits.
+
 Build an MO2 Python/PyQt6 tool plugin, with a separate, testable Python core for planning, provenance, and journaled file operations. Start with MO2 2.5.2 and Skyrim SE/AE. A standalone log viewer can reuse that core later; a standalone conflict scanner would need to reconstruct MO2's current state and is less suitable as the first UI.
 
 Use MO2's public API rather than hooking TrueFolder's Qt model. Reconstruct the selection tree from separator names and actual profile priority. This avoids depending on TrueFolder's C++ internals. Capability-check the installed Python API at startup; the installed BOSSE Python bridge is not necessarily identical to a stock 2.5.2 distribution.

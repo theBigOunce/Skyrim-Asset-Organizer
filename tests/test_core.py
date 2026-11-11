@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugin' / 'SkyrimAssetOrganizer'))
 from core import Mod, scan, execute, digest
+from unittest.mock import patch
 
 
 class CoreTests(unittest.TestCase):
@@ -38,7 +40,9 @@ class CoreTests(unittest.TestCase):
         return path
 
     def plan(self, **kwargs):
-        return scan(self.mods, {'A','B'}, {'.dds'}, **kwargs)
+        plan=scan(self.mods, {'A','B'}, {'.dds'}, **kwargs)
+        self.addCleanup(plan.close)
+        return plan
 
     def test_selected_scope_and_folders(self):
         plan = self.plan()
@@ -56,7 +60,9 @@ class CoreTests(unittest.TestCase):
         events = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(events[-1]['event'], 'finished')
         self.assertEqual(len([e for e in events if e['event']=='completed']), len(plan.actions))
-        self.assertTrue(all('sha256' in a and 'metadata' in a for a in events[0]['actions']))
+        self.assertEqual(events[0]['schema'],2)
+        self.assertTrue(all('sha256' in a for a in events if a['event']=='asset'))
+        self.assertTrue(any(a['event']=='mod' and 'metadata' in a for a in events))
 
     def test_stale_plan(self):
         plan = self.plan()
@@ -122,7 +128,9 @@ class CoreTests(unittest.TestCase):
         with zipfile.ZipFile(archive, 'w') as stream:
             stream.write(original, 'textures/landscape/rock.dds')
         log = execute(self.plan(),self.root,self.root/'logs')
-        record = json.loads(log.read_text().splitlines()[0])['actions'][0]
+        events=[json.loads(line) for line in log.read_text().splitlines()]
+        action=next(r for r in events if r['event']=='planned')
+        record=next(r for r in events if r['event']=='asset' and r['id']==action['source_id'])
         with zipfile.ZipFile(archive) as stream:
             original.write_bytes(stream.read(record['relative']))
         self.assertEqual(digest(original),expected)
@@ -135,6 +143,64 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 execute(plan,self.root,self.root/'logs')
         self.assertTrue(Path(plan.actions[0]['source']).exists())
+
+    def test_unrelated_assets_never_hashed(self):
+        with patch('core.digest', wraps=digest) as hashing:
+            plan=self.plan()
+            self.assertEqual(hashing.call_count,0)
+            self.assertEqual(plan.stats['hashed_bytes'],0)
+            self.assertEqual(len(plan.actions),1)
+            execute(plan,self.root,self.root/'logs')
+            self.assertEqual(hashing.call_count,2)
+            self.assertEqual(plan.stats['hashed_bytes'],2)
+
+    def test_cancelled_scan(self):
+        from core import ScanCancelled
+        with self.assertRaises(ScanCancelled):
+            scan(self.mods,{'A','B'},{'.dds'},cancel=lambda:True)
+
+    def test_copy_failure_keeps_sources(self):
+        plan=self.plan(combine=True,output_name='Combined',delete_sources=True)
+        with patch('shutil.copyfileobj',side_effect=OSError('disk full')):
+            with self.assertRaises(OSError): execute(plan,self.root,self.root/'logs')
+        self.assertTrue((self.root/'mods/A/textures/landscape/rock.dds').exists())
+        self.assertTrue((self.root/'mods/B/textures/landscape/rock.dds').exists())
+
+    def test_log_search_resolves_provenance(self):
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+        from log_report import report
+        log=execute(self.plan(),self.root,self.root/'logs')
+        rows=list(report(log,mod='A',contains='landscape/rock'))
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['status'],'completed')
+        self.assertEqual(rows[0]['winner_mod']['name'],'B')
+        self.assertEqual(rows[0]['source']['sha256'],hashlib.sha256(b'a').hexdigest())
+
+    def test_profile_changes_invalidate_plan(self):
+        rows=[dict(name=m.name,priority=m.priority,enabled=m.enabled,separator=m.separator) for m in self.mods]
+        profile=self.root/'profile.json'; profile.write_text(json.dumps(rows))
+        plan=self.plan()
+        rows[0]['enabled']=False; profile.write_text(json.dumps(rows))
+        with self.assertRaisesRegex(ValueError,'Profile is stale'):
+            execute(plan,self.root,self.root/'logs')
+        self.assertTrue(Path(plan.actions[0]['source']).exists())
+
+    def test_profile_publication_failure_keeps_sources(self):
+        plan=self.plan(combine=True,output_name='Combined',delete_sources=True)
+        with patch('journal.os.replace',side_effect=OSError('publication failed')):
+            with self.assertRaises(OSError): execute(plan,self.root,self.root/'logs')
+        self.assertTrue((self.root/'mods/A/textures/landscape/rock.dds').exists())
+        self.assertTrue((self.root/'mods/B/textures/landscape/rock.dds').exists())
+
+    def test_unreadable_directory_aborts_scan(self):
+        import os
+        original_walk=os.walk
+        def walk(path,*args,**kwargs):
+            if '.sao-cache' in Path(path).parts: return original_walk(path,*args,**kwargs)
+            kwargs['onerror'](PermissionError('unreadable directory'))
+            return []
+        with patch('core.os.walk',side_effect=walk):
+            with self.assertRaises(PermissionError): self.plan()
 
 
 if __name__ == '__main__':

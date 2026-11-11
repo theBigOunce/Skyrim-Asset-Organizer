@@ -20,7 +20,7 @@ class SkyrimAssetOrganizer(mobase.IPluginTool):
     def name(self): return 'Skyrim Asset Organizer'
     def author(self): return 'Skyrim Asset Organizer contributors'
     def description(self): return 'Preview selected loose NIF/DDS conflicts and combinations. Live writes disabled in this test build.'
-    def version(self): return mobase.VersionInfo(0,1,0)
+    def version(self): return mobase.VersionInfo(0,2,0)
     def settings(self): return []
     def displayName(self): return 'Skyrim Asset Organizer (Preview)'
     def tooltip(self): return self.description()

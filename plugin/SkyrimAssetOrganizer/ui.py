@@ -1,15 +1,104 @@
 """MO2-style selection dialog; live instances are always preview-only."""
 import json
+from threading import Event
 from pathlib import Path
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QFont, QFontDatabase
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QFileDialog,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter,
-    QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+    QHeaderView, QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 try:
-    from .core import Mod, scan, execute
+    from .core import Mod, ScanCancelled, scan, execute
 except ImportError:
-    from core import Mod, scan, execute
+    from core import Mod, ScanCancelled, scan, execute
+
+
+class ActionModel(QAbstractTableModel):
+    """Read only the requested row; actions may be a disk-backed sequence."""
+    keys = ('kind', 'mod', 'relative', 'winner', 'size')
+    headers = ('Action', 'Source mod', 'Full relative asset path', 'Selected winner', 'Bytes')
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.actions = None
+        self._count = 0
+        self._row = -1
+        self._action = None
+        self._tooltip = None
+
+    def set_actions(self, actions):
+        self.beginResetModel()
+        self.actions = actions
+        self._count = 0 if actions is None else len(actions)
+        self._row, self._action = -1, None
+        self._tooltip = None
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else self._count
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.keys)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole:
+            if orientation == Qt.Orientation.Horizontal and 0 <= section < len(self.headers):
+                return self.headers[section]
+            if orientation == Qt.Orientation.Vertical:
+                return str(section + 1)
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if (not index.isValid() or self.actions is None or
+                not 0 <= index.row() < self._count or
+                not 0 <= index.column() < len(self.keys) or
+                role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole)):
+            return None
+        if self._row != index.row():
+            self._action = self.actions[index.row()]
+            self._row = index.row()
+            self._tooltip = None
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if self._tooltip is None:
+                self._tooltip = json.dumps(self._action, ensure_ascii=False, indent=2)
+            return self._tooltip
+        return str(self._action[self.keys[index.column()]])
+
+
+class ScanWorker(QThread):
+    progress = pyqtSignal(str)
+    result = pyqtSignal(object)
+    error = pyqtSignal(object)
+
+    def __init__(self, mods, selected, extensions, options, parent=None):
+        super().__init__(parent)
+        self.mods, self.selected, self.extensions = mods, selected, extensions
+        self.options = options
+        self.cancel_requested = Event()
+
+    def run(self):
+        plan = None
+        try:
+            if self.cancel_requested.is_set():
+                return
+            plan = scan(self.mods, self.selected, self.extensions,
+                        progress=self.progress.emit, cancel=self.cancel_requested.is_set,
+                        **self.options)
+            removed = copied = 0
+            self.progress.emit('Counting preview totals…')
+            for action in plan.actions:
+                if self.cancel_requested.is_set():
+                    return
+                if action['kind'] == 'copy': copied += action['size']
+                else: removed += action['size']
+            if not self.cancel_requested.is_set():
+                self.result.emit((plan, removed, copied))
+                plan = None  # Ownership passes to the GUI result slot.
+        except Exception as error:
+            self.error.emit(error)
+        finally:
+            if plan is not None and callable(getattr(plan, 'close', None)):
+                plan.close()
 
 
 class OrganizerDialog(QDialog):
@@ -24,6 +113,8 @@ class OrganizerDialog(QDialog):
         self.sandbox_root = Path(sandbox_root) if sandbox_root else None
         self.plan = None
         self.busy = False
+        self.scan_thread = None
+        self._pending_close = None
         self.rows = {}
         self.setWindowTitle('Skyrim Asset Organizer — Disposable Demo' if sandbox_root else 'Skyrim Asset Organizer — Live Preview Only')
         self.resize(1180, 820)
@@ -34,6 +125,7 @@ class OrganizerDialog(QDialog):
         note.setStyleSheet('padding:8px; background:#40351b; color:#ffe3a0')
         layout.addWidget(note)
         bar = QHBoxLayout()
+        self.selection_buttons = []
         self.search = QLineEdit()
         self.search.setPlaceholderText('Find mods… hidden checked mods stay selected')
         self.search.setObjectName('searchEdit')
@@ -41,6 +133,7 @@ class OrganizerDialog(QDialog):
         for label, callback in [('Select all',lambda:self.check_all(True)),('Clear',lambda:self.check_all(False)),('Expand',lambda:self.tree.expandAll()),('Collapse',lambda:self.tree.collapseAll())]:
             button = QPushButton(label)
             button.clicked.connect(callback)
+            self.selection_buttons.append(button)
             bar.addWidget(button)
         layout.addLayout(bar)
         split = QSplitter(Qt.Orientation.Vertical)
@@ -52,8 +145,10 @@ class OrganizerDialog(QDialog):
         self.tree.setSortingEnabled(False)
         self.tree.setAlternatingRowColors(True)
         split.addWidget(self.tree)
-        self.table = QTableWidget(0,5)
-        self.table.setHorizontalHeaderLabels(['Action','Source mod','Full relative asset path','Selected winner','Bytes'])
+        self.table = QTableView()
+        self.action_model = ActionModel(self.table)
+        self.table.setModel(self.action_model)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setColumnWidth(0,120)
         self.table.setColumnWidth(1,180)
@@ -85,13 +180,16 @@ class OrganizerDialog(QDialog):
         layout.addWidget(self.summary)
         actions = QHBoxLayout()
         self.scan_button = QPushButton('Scan / Preview'); self.scan_button.setObjectName('scanButton')
+        self.cancel_button = QPushButton('Cancel scan'); self.cancel_button.setObjectName('cancelScanButton')
+        self.cancel_button.setEnabled(False)
         self.apply_button = QPushButton('Apply to disposable testbed'); self.apply_button.setObjectName('applyButton')
         self.export_button = QPushButton('Export preview')
         logs = QPushButton('Open logs'); logs.setEnabled(bool(sandbox_root))
         close = QPushButton('Close')
-        for button in (self.scan_button,self.apply_button,self.export_button,logs,close): actions.addWidget(button)
+        for button in (self.scan_button,self.cancel_button,self.apply_button,self.export_button,logs,close): actions.addWidget(button)
         layout.addLayout(actions)
         self.scan_button.clicked.connect(self.preview)
+        self.cancel_button.clicked.connect(self.cancel_scan)
         self.apply_button.clicked.connect(self.apply)
         self.export_button.clicked.connect(self.export)
         logs.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.sandbox_root/'logs'))))
@@ -141,6 +239,7 @@ class OrganizerDialog(QDialog):
         return {m.name for m in self.mods if m.enabled and not m.separator and self.rows[m.name].checkState(0)==Qt.CheckState.Checked}
 
     def check_all(self,checked):
+        if self.busy: return
         self.tree.blockSignals(True)
         for mod in self.mods:
             if mod.enabled or mod.separator:
@@ -188,41 +287,116 @@ class OrganizerDialog(QDialog):
         for i in range(self.tree.topLevelItemCount()): visit(self.tree.topLevelItem(i))
 
     def invalidate(self,*args):
+        if self.busy: return
+        self.action_model.set_actions(None)
+        old_plan = self.plan
         self.plan=None
+        if old_plan is not None and callable(getattr(old_plan, 'close', None)):
+            old_plan.close()
         self.apply_button.setEnabled(False)
         self.export_button.setEnabled(False)
-        self.table.setRowCount(0)
         self.summary.setText(f'{len(self.selected())} mods checked (including any hidden by search). Scan to review actions. Only selected enabled mods conflict with one another.')
 
     def options_changed(self,*args):
+        if self.busy: return
         self.output.setEnabled(self.combine.isChecked())
         self.remove_sources.setEnabled(self.combine.isChecked())
         self.invalidate()
 
     def preview(self):
-        self.scan_button.setEnabled(False)
-        self.summary.setText('Scanning and hashing assets…')
-        try:
-            extensions=({'.nif'} if self.nif.isChecked() else set()) | ({'.dds'} if self.dds.isChecked() else set())
-            self.plan=scan(self.mods,self.selected(),extensions,cleanup=self.cleanup.isChecked(),combine=self.combine.isChecked(),output_name=self.output.text(),delete_sources=self.combine.isChecked() and self.remove_sources.isChecked())
-            self.plan.profile=self.profile_name
-            self.table.setRowCount(len(self.plan.actions))
-            for row,action in enumerate(self.plan.actions):
-                for column,key in enumerate(('kind','mod','relative','winner','size')):
-                    cell=QTableWidgetItem(str(action[key])); cell.setToolTip(json.dumps(action,ensure_ascii=False,indent=2)); self.table.setItem(row,column,cell)
-            removed=sum(a['size'] for a in self.plan.actions if a['kind']!='copy')
-            copied=sum(a['size'] for a in self.plan.actions if a['kind']=='copy')
-            self.summary.setText(f'{len(self.selected())} mods checked · {len(self.plan.actions)} actions · remove {removed:,} bytes · copy {copied:,} bytes · net logical savings {removed-copied:,} bytes. Full relative paths preserved. Recovery uses logs only.')
-            self.apply_button.setEnabled(bool(self.sandbox_root and self.plan.actions))
-            self.export_button.setEnabled(True)
-        except Exception as error:
-            self.invalidate()
-            QMessageBox.critical(self,'Scan failed',str(error))
-        finally:
-            self.scan_button.setEnabled(True)
+        if self.busy: return
+        self.invalidate()
+        extensions=({'.nif'} if self.nif.isChecked() else set()) | ({'.dds'} if self.dds.isChecked() else set())
+        options = dict(cleanup=self.cleanup.isChecked(), combine=self.combine.isChecked(),
+                       output_name=self.output.text(),
+                       delete_sources=self.combine.isChecked() and self.remove_sources.isChecked())
+        worker = ScanWorker(list(self.mods), self.selected(), extensions, options, self)
+        self.scan_thread = worker
+        worker.progress.connect(self.scan_progress)
+        worker.result.connect(self.scan_result)
+        worker.error.connect(self.scan_error)
+        worker.finished.connect(self.scan_finished)
+        self.set_scanning(True)
+        self.summary.setText('Indexing asset paths; content hashes are verified at Apply…')
+        worker.start()
+
+    def set_scanning(self, busy):
+        self.busy = busy
+        for control in (self.tree, self.search, self.cleanup, self.nif, self.dds,
+                        self.combine, *self.selection_buttons):
+            control.setEnabled(not busy)
+        self.output.setEnabled(not busy and self.combine.isChecked())
+        self.remove_sources.setEnabled(not busy and self.combine.isChecked())
+        self.scan_button.setEnabled(not busy)
+        self.cancel_button.setEnabled(busy)
+        self.apply_button.setEnabled(not busy and self.sandbox_root is not None and
+                                     self.plan is not None and len(self.plan.actions) > 0)
+        self.export_button.setEnabled(not busy and self.plan is not None)
+
+    def scan_progress(self, message):
+        if self.busy and not self.scan_thread.cancel_requested.is_set():
+            self.summary.setText(message)
+
+    def scan_result(self, result):
+        plan, removed, copied = result
+        if self.scan_thread.cancel_requested.is_set():
+            if callable(getattr(plan, 'close', None)): plan.close()
+            return
+        self.plan = plan
+        plan.profile = self.profile_name
+        self.action_model.set_actions(plan.actions)
+        stats = plan.stats
+        self.summary.setText(f'{len(plan.selected)} mods checked · {self.action_model.rowCount()} actions · {stats["files"]:,} files indexed · {stats["hashed_files"]:,} hashed ({stats["hashed_bytes"]:,} bytes) · remove {removed:,} bytes · copy {copied:,} bytes · net logical savings {removed-copied:,} bytes. Full relative paths preserved. Recovery uses logs only.')
+
+    def scan_error(self, error):
+        if self.scan_thread.cancel_requested.is_set() or isinstance(error, ScanCancelled):
+            self.summary.setText('Scan cancelled.')
+            return
+        self.summary.setText(f'Scan failed: {error}')
+        QMessageBox.critical(self, 'Scan failed', str(error))
+
+    def scan_finished(self):
+        worker = self.scan_thread
+        # finished is emitted at the end of run; wait for final native cleanup.
+        worker.wait()
+        if worker.cancel_requested.is_set():
+            self.summary.setText('Scan cancelled.')
+            self.action_model.set_actions(None)
+            if self.plan is not None and callable(getattr(self.plan, 'close', None)):
+                self.plan.close()
+            self.plan = None
+        self.scan_thread = None
+        worker.deleteLater()
+        self.set_scanning(False)
+        if self._pending_close is not None:
+            result, self._pending_close = self._pending_close, None
+            self.done(result)
+
+    def cancel_scan(self):
+        if self.scan_thread is not None:
+            self.scan_thread.cancel_requested.set()
+            self.cancel_button.setEnabled(False)
+            self.summary.setText('Cancelling scan; waiting for worker to finish…')
+
+    def done(self, result):
+        if self.busy:
+            self._pending_close = result
+            self.cancel_scan()
+            return
+        self.invalidate()
+        super().done(result)
+
+    def closeEvent(self, event):
+        if self.busy:
+            self._pending_close = QDialog.DialogCode.Rejected
+            self.cancel_scan()
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
     def apply(self):
-        if not self.sandbox_root or not self.plan: return
+        """Synchronous fixture-only execution; live/production writes are disabled."""
+        if self.busy or not self.sandbox_root or not self.plan: return
         answer=QMessageBox.question(self,'Apply to disposable sample?',f'Apply {len(self.plan.actions)} actions inside:\n{self.sandbox_root}\n\nRemoved files have logs only. No backups are retained.',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)
         if answer!=QMessageBox.StandardButton.Yes: return
         try:
@@ -240,9 +414,18 @@ class OrganizerDialog(QDialog):
             QMessageBox.critical(self,'Operation stopped',f'{error}\nInspect the sample logs for completed and uncertain actions. No automatic undo is available.')
 
     def export(self):
-        if not self.plan: return
+        if self.busy or not self.plan: return
         filename,_=QFileDialog.getSaveFileName(self,'Export preview','','JSON (*.json)')
         if filename:
             try:
-                Path(filename).write_text(json.dumps(dict(profile=self.profile_name,selected=sorted(self.plan.selected),actions=self.plan.actions),ensure_ascii=False,indent=2),encoding='utf-8')
+                with Path(filename).open('w', encoding='utf-8') as stream:
+                    stream.write('{"profile": ')
+                    json.dump(self.profile_name, stream, ensure_ascii=False)
+                    stream.write(', "selected": ')
+                    json.dump(sorted(self.plan.selected), stream, ensure_ascii=False)
+                    stream.write(', "actions": [\n')
+                    for index, action in enumerate(self.plan.actions):
+                        if index: stream.write(',\n')
+                        json.dump(action, stream, ensure_ascii=False)
+                    stream.write('\n]}\n')
             except OSError as error: QMessageBox.critical(self,'Export failed',str(error))
