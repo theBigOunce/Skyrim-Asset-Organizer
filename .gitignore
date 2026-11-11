@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+testbeds/
+dist/
+artifacts/
+# Local reference sources, not part of this project's distribution.
+lostdragonistsmods/
+mo2.5.2source/
+truefolder2/
